@@ -5,6 +5,11 @@ import plotly.express as px
 import plotly.graph_objects as go
 import os
 import time
+import xml.etree.ElementTree as ET
+import torch
+import torch.nn as nn
+from sklearn.preprocessing import MinMaxScaler
+from datetime import datetime
 
 # Set page config
 st.set_page_config(
@@ -37,8 +42,135 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
+# ─── MODEL DEFINITION ────────────────────────────────────────────────────────
+class LightweightAutoencoder(nn.Module):
+    def __init__(self, input_dim, hidden_dim=8):
+        super(LightweightAutoencoder, self).__init__()
+        self.encoder = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim * 2),
+            nn.ReLU(),
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.ReLU()
+        )
+        self.decoder = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim * 2),
+            nn.ReLU(),
+            nn.Linear(hidden_dim * 2, input_dim),
+            nn.Sigmoid()
+        )
+    def forward(self, x):
+        return self.decoder(self.encoder(x))
+
+# ─── XML PARSER ─────────────────────────────────────────────────────────────
+def parse_apple_health_xml(file_obj):
+    progress_bar = st.progress(0, text="Iterating through Apple Health XML...")
+    records = []
+    
+    # Iterate through elements using iterative parsing to save memory
+    context = ET.iterparse(file_obj, events=("end",))
+    
+    # Target types
+    target_hr = "HKQuantityTypeIdentifierHeartRate"
+    target_steps = "HKQuantityTypeIdentifierStepCount"
+    
+    count = 0
+    for event, elem in context:
+        if elem.tag == "Record":
+            rec_type = elem.get("type", "")
+            if rec_type in [target_hr, target_steps]:
+                start_date = elem.get("startDate")
+                value = elem.get("value")
+                
+                if start_date and value:
+                    records.append({
+                        'timestamp': start_date,
+                        'type': 'HeartRate' if rec_type == target_hr else 'StepCount',
+                        'value': float(value)
+                    })
+        
+        # Clean up element to free memory
+        elem.clear()
+        count += 1
+        if count % 10000 == 0:
+            progress_bar.progress(min(0.9, count / 500000), text=f"Parsed {count:,} health records...")
+
+    progress_bar.empty()
+    if not records:
+        return None
+        
+    df = pd.DataFrame(records)
+    df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True)
+    
+    # Pivot and Resample
+    df_pivot = df.pivot_table(index='timestamp', columns='type', values='value', aggfunc='mean')
+    df_resampled = df_pivot.resample('1H').mean()
+    
+    # Clean up columns
+    if 'HeartRate' in df_resampled.columns:
+        df_resampled['HeartRate'] = df_resampled['HeartRate'].ffill().bfill()
+    else:
+        df_resampled['HeartRate'] = 70.0
+        
+    if 'StepCount' in df_resampled.columns:
+        df_resampled['StepCount'] = df_resampled['StepCount'].fillna(0)
+    else:
+        df_resampled['StepCount'] = 0.0
+        
+    return df_resampled.fillna(0).reset_index()
+
+# ─── INFERENCE ENGINE ─────────────────────────────────────────────────────────
+def run_anomaly_inference(df):
+    status = st.status("🧠 Running Deep Learning Anomaly Detection...")
+    
+    input_df = df[['HeartRate', 'StepCount']]
+    scaler = MinMaxScaler()
+    scaled_data = scaler.fit_transform(input_df)
+    
+    window_size = 24
+    sequences = []
+    for i in range(len(scaled_data) - window_size + 1):
+        sequences.append(scaled_data[i:i + window_size])
+    sequences = np.array(sequences)
+    
+    if len(sequences) == 0:
+        status.update(label="❌ Not enough data for 24-hour analysis.", state="error")
+        return None
+        
+    input_dim = window_size * 2
+    X = torch.tensor(sequences.reshape(-1, input_dim), dtype=torch.float32)
+    
+    # Training a fresh model for this user (MLP is fast)
+    model = LightweightAutoencoder(input_dim=input_dim)
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+    criterion = nn.MSELoss()
+    
+    # Train heavily for 30 epochs
+    for _ in range(30):
+        model.train()
+        optimizer.zero_grad()
+        loss = criterion(model(X), X)
+        loss.backward()
+        optimizer.step()
+    
+    model.eval()
+    with torch.no_grad():
+        preds = model(X)
+        errors = torch.mean((preds - X) ** 2, dim=1).numpy()
+    
+    # threshold
+    threshold = float(np.percentile(errors, 95))
+    
+    # Map back to df
+    results_df = df.iloc[:len(errors)].copy()
+    results_df['reconstruction_error'] = errors
+    results_df['is_anomaly'] = errors > threshold
+    results_df['threshold'] = threshold
+    
+    status.update(label="✅ Analysis Complete!", state="complete")
+    return results_df
+
 # ─── HEADER ───────────────────────────────────────────────────────────────────
-st.title("🧬 Circadian Rhythm Anomaly Detection")
+st.title("🧬 Circadian Rhythm Anomaly Detector")
 st.markdown("**Real-time Monitoring & Deep Learning Analytics Dashboard**")
 st.markdown("A lightweight autoencoder trained on wearable sensor data to detect circadian rhythm disruptions.")
 st.markdown("---")
@@ -49,9 +181,14 @@ with st.sidebar:
     st.markdown("## ⚙️ Settings")
     st.markdown("---")
     uploaded_file = st.file_uploader(
-        "📂 Upload `dashboard_data` (generated by `anomaly_detector.py`)",
-        help="Upload the generated dataset file (up to 2GB supported). Any extension is supported as long as it contains the required columns."
+        "📂 Upload `export.xml` or `dashboard_data`",
+        help="Upload raw Apple Health Zip/XML or the generated dataset file (up to 2GB supported)."
     )
+    
+    if st.button("🗑️ Clear Cache"):
+        st.cache_data.clear()
+        st.rerun()
+
     st.markdown("---")
     st.markdown("### 📌 About")
     st.markdown("""
@@ -67,37 +204,41 @@ with st.sidebar:
 @st.cache_data
 def load_data_from_file(file):
     try:
-        # Seek back to start just in case
-        file.seek(0)
+        file_name = file.name.lower()
         
-        # Read the file to find the header row (sometimes CSVs have metadata at top)
+        # Scenario 1: Raw Apple Health XML
+        if file_name.endswith('.xml'):
+            status = st.info("ℹ️ XML file detected. We are parsing your raw Apple Health data...")
+            raw_df = parse_apple_health_xml(file)
+            if raw_df is not None:
+                final_df = run_anomaly_inference(raw_df)
+                return final_df
+            return None
+            
+        # Scenario 2: Pre-processed CSV
+        file.seek(0)
         content = file.read().decode('utf-8', errors='ignore').splitlines()
         header_row = 0
         found_header = False
-        
-        for i, line in enumerate(content[:50]): # Check first 50 lines
+        for i, line in enumerate(content[:50]):
             if 'timestamp' in line.lower() and ('heartrate' in line.lower() or 'stepcount' in line.lower()):
                 header_row = i
                 found_header = True
                 break
         
         file.seek(0)
-        if found_header:
-            df = pd.read_csv(file, skiprows=header_row)
-        else:
-            # Fallback to standard read if 'timestamp' string isn't obvious
-            df = pd.read_csv(file, on_bad_lines='skip')
+        df = pd.read_csv(file, skiprows=header_row) if found_header else pd.read_csv(file, on_bad_lines='skip')
 
         if 'timestamp' not in df.columns:
-            st.error("❌ Invalid format: Could not find the required 'timestamp' column. Please upload the data generated by the anomaly detector.")
+            st.error("❌ Invalid format: Could not find required columns. Please upload the data generated by the anomaly detector or a raw export.xml.")
             return None
         
         df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')
-        df = df.dropna(subset=['timestamp']) # Remove rows where timestamp couldn't be parsed
+        df = df.dropna(subset=['timestamp']).sort_values('timestamp')
         return df
         
     except Exception as e:
-        st.error(f"❌ Error reading file: {e}. Please ensure you are uploading the correct `dashboard_data.csv` style format.")
+        st.error(f"❌ Error processing file: {e}")
         return None
 
 @st.cache_data
@@ -106,11 +247,11 @@ def load_local_data():
     data_path = os.path.join(current_dir, "dashboard_data.csv")
     if os.path.exists(data_path):
         df = pd.read_csv(data_path)
-        df['timestamp'] = pd.to_datetime(df['timestamp'])
-        return df
+        df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')
+        return df.sort_values('timestamp').dropna(subset=['timestamp'])
     return None
 
-# Load data: uploaded > local file
+# Load logic
 if uploaded_file is not None:
     df = load_data_from_file(uploaded_file)
 else:
@@ -118,215 +259,71 @@ else:
 
 # ─── MAIN DASHBOARD ───────────────────────────────────────────────────────────
 if df is not None:
-    df['is_anomaly'] = df['is_anomaly'].fillna(False).astype(bool)
-    anomalies_df = df[df['is_anomaly']]
-    normal_df = df[~df['is_anomaly']]
-    threshold_val = df['threshold'].iloc[0]
+    if 'is_anomaly' in df.columns:
+        df['is_anomaly'] = df['is_anomaly'].fillna(False).astype(bool)
+        anomalies_df = df[df['is_anomaly']]
+        normal_df = df[~df['is_anomaly']]
+        threshold_val = df['threshold'].iloc[0] if 'threshold' in df.columns else 0.05
 
-    # ── Feature Analysis ──────────────────────────────────────────────────────
-    hr_std_norm = normal_df['HeartRate'].std()
-    hr_std_anom = anomalies_df['HeartRate'].std() if len(anomalies_df) > 0 else 0
-    step_std_norm = normal_df['StepCount'].std()
-    step_std_anom = anomalies_df['StepCount'].std() if len(anomalies_df) > 0 else 0
+        # Metrics
+        total_hours = len(df)
+        total_anomalies = len(anomalies_df)
+        anomaly_rate = (total_anomalies / total_hours) * 100 if total_hours > 0 else 0
+        
+        # Attribution
+        hr_std_norm = normal_df['HeartRate'].std() if 'HeartRate' in normal_df.columns else 1
+        hr_std_anom = anomalies_df['HeartRate'].std() if len(anomalies_df) > 0 else 0
+        hr_deviation = (hr_std_anom - hr_std_norm) / hr_std_norm if hr_std_norm > 0 else 0
+        
+        step_std_norm = normal_df['StepCount'].std() if 'StepCount' in normal_df.columns else 1
+        step_std_anom = anomalies_df['StepCount'].std() if len(anomalies_df) > 0 else 0
+        step_deviation = (step_std_anom - step_std_norm) / step_std_norm if step_std_norm > 0 else 0
+        
+        primary_cause = "Heart Rate" if hr_deviation > step_deviation else "Step Count"
 
-    hr_deviation = (hr_std_anom - hr_std_norm) / hr_std_norm if hr_std_norm > 0 else 0
-    step_deviation = (step_std_anom - step_std_norm) / step_std_norm if step_std_norm > 0 else 0
-    primary_cause = "Heart Rate" if hr_deviation > step_deviation else "Step Count"
+        # KPI Metrics Row
+        st.subheader("📊 Key Performance Indicators")
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("🕐 Monitored Hours", f"{total_hours:,}")
+        c2.metric("⚠️ Anomalies Detected", f"{total_anomalies:,}")
+        c3.metric("📈 Anomaly Rate", f"{anomaly_rate:.2f}%")
+        c4.metric("🔑 Primary Driver", primary_cause)
+        c5.metric("🤖 Detection Mode", "Real-time AI Inference")
 
-    # ── Model Evaluation Metrics ───────────────────────────────────────────────
-    total_params = (48 * 16) + 16 + (16 * 8) + 8 + (8 * 16) + 16 + (16 * 48) + 48  # Autoencoder params
-    
-    total_hours = len(df)
-    total_anomalies = len(anomalies_df)
-    anomaly_rate = (total_anomalies / total_hours) * 100 if total_hours > 0 else 0
+        st.markdown("---")
+        
+        # Doctor recommendations
+        st.subheader("👨‍⚕️ Digital Doctor's Analysis & Recommendations")
+        if total_anomalies == 0:
+            st.success("✅ **Doctor's Note:** Your circadian rhythm looks exceptional. Keep up the routine!")
+        else:
+            st.warning(f"⚠️ **Doctor's Note:** We detected **{total_anomalies} hours** of circadian disruption. Primary driver: **{primary_cause}**.")
+            
+            cd1, cd2 = st.columns(2)
+            with cd1:
+                st.markdown("##### 🫀 Heart Rate Recommendations")
+                st.info("Limit caffeine 6h before bed | Practice box breathing | Monitor resting HR.")
+            with cd2:
+                st.markdown("##### 👟 Activity Recommendations")
+                st.info("Consistent wake time | Morning sunlight exposure | Avoid vigorous night exercise.")
 
-    # ── KPI Metrics Row ───────────────────────────────────────────────────────
-    st.subheader("📊 Key Performance Indicators")
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("🕐 Monitored Hours", f"{total_hours:,}")
-    c2.metric("⚠️ Anomalies Detected", f"{total_anomalies:,}")
-    c3.metric("📈 Anomaly Rate", f"{anomaly_rate:.2f}%")
-    c4.metric("🔑 Primary Driver", primary_cause)
-    c5.metric("🤖 Model Parameters", f"{total_params:,}")
+        # Timeline
+        st.subheader("❤️ Heart Rate Timeline")
+        fig_hr = go.Figure()
+        fig_hr.add_trace(go.Scatter(x=df['timestamp'], y=df['HeartRate'], mode='lines', name='Heart Rate', line=dict(color='#00CC96')))
+        fig_hr.add_trace(go.Scatter(x=anomalies_df['timestamp'], y=anomalies_df['HeartRate'], mode='markers', name='Anomaly', marker=dict(color='#EF553B', size=8, symbol='x')))
+        fig_hr.update_layout(template="plotly_dark", height=400)
+        st.plotly_chart(fig_hr, use_container_width=True)
 
-    st.markdown("---")
-
-    # ── Model Evaluation Section ───────────────────────────────────────────────
-    st.subheader("🔬 Model Evaluation & Efficiency Metrics")
-    ev1, ev2, ev3, ev4 = st.columns(4)
-    with ev1:
-        st.metric("Architecture", "MLP Autoencoder")
-        st.caption("Lightweight & resource-efficient")
-    with ev2:
-        st.metric("Latent Dimension", "8 neurons")
-        st.caption("Compact representation of circadian cycle")
-    with ev3:
-        st.metric("Anomaly Threshold", f"{threshold_val:.4f}")
-        st.caption("95th percentile of training reconstruction errors")
-    with ev4:
-        # Compute anomaly precision-like metric based on std deviation ratio
-        separation = abs(hr_deviation if primary_cause == "Heart Rate" else step_deviation)
-        quality = min(99.9, 50 + separation * 20)
-        st.metric("Detection Confidence", f"{quality:.1f}%")
-        st.caption("Based on anomaly vs. normal variance separation")
-
-    # Attribution chart
-    st.markdown("#### 📉 Feature Anomaly Attribution")
-    attr_fig = go.Figure(go.Bar(
-        x=['Heart Rate Deviation', 'Step Count Deviation'],
-        y=[max(0, hr_deviation * 100), max(0, step_deviation * 100)],
-        marker_color=['#EF553B' if primary_cause == 'Heart Rate' else '#636EFA',
-                      '#636EFA' if primary_cause == 'Heart Rate' else '#EF553B'],
-        text=[f"{max(0, hr_deviation*100):.1f}%", f"{max(0, step_deviation*100):.1f}%"],
-        textposition='outside'
-    ))
-    attr_fig.update_layout(
-        template="plotly_dark",
-        yaxis_title="Deviation from Normal (%)",
-        title="Which feature deviated most during anomalies",
-        height=300
-    )
-    st.plotly_chart(attr_fig, use_container_width=True)
-
-    st.markdown("---")
-
-    # ── Doctor's Recommendations ───────────────────────────────────────────────
-    st.subheader("👨‍⚕️ Digital Doctor's Analysis & Recommendations")
-
-    if total_anomalies == 0:
-        st.success("✅ **Doctor's Note:** Your circadian rhythm looks exceptional. Keep up the routine!")
+        with st.expander("📋 View Raw Analytics Data"):
+            st.dataframe(df, use_container_width=True)
     else:
-        st.warning(
-            f"⚠️ **Doctor's Note:** We detected **{total_anomalies} hours** of circadian disruption "
-            f"({anomaly_rate:.1f}% of monitored time). The primary metric responsible is **{primary_cause}**."
-        )
-        
-        col_doc1, col_doc2 = st.columns(2)
-        
-        with col_doc1:
-            st.markdown("##### 🫀 Heart Rate Recommendations")
-            if primary_cause == "Heart Rate":
-                st.error("⬆️ **PRIMARY DRIVER** — Heart Rate anomalies are dominant")
-            st.info("""
-**1. Limit Stimulants Before Bed**  
-Avoid caffeine, alcohol, or heavy meals at least 4–6 hours before sleep.
-
-**2. Manage Stress Actively**  
-Practice 10–15 min of meditation, box breathing, or progressive muscle relaxation before bed.
-
-**3. Stay Hydrated**  
-Mild dehydration can cause elevated resting heart rate. Aim for 8 glasses of water daily.
-
-**4. Seek Medical Advice if Persistent**  
-Consistently elevated resting HR (>100 bpm) warrants a doctor's consultation for cardiovascular screening.
-            """)
-
-        with col_doc2:
-            st.markdown("##### 👟 Activity & Sleep Schedule Recommendations")
-            if primary_cause == "Step Count":
-                st.error("⬆️ **PRIMARY DRIVER** — Activity pattern anomalies are dominant")
-            st.info("""
-**1. Morning Sunlight Exposure**  
-Get 10–15 min of natural sunlight within 30 min of waking. This anchors your biological clock.
-
-**2. Consistent Sleep–Wake Times**  
-Wake at the same time every day — even weekends. Irregular schedules are a leading cause of circadian misalignment.
-
-**3. Avoid Evening Vigorous Exercise**  
-Keep intense workouts (cardio/weights) to morning or late afternoon. Avoid 2–3 hrs before sleep.
-
-**4. Break Up Sedentary Periods**  
-Stand or walk for 5 min every hour during the day. Prolonged inactivity disrupts metabolic rhythms.
-            """)
-
-        # Time of day distribution for anomalies
-        if len(anomalies_df) > 0:
-            st.markdown("##### 🕐 When Do Anomalies Occur? (Hour of Day)")
-            anomalies_df2 = anomalies_df.copy()
-            anomalies_df2['hour'] = anomalies_df2['timestamp'].dt.hour
-            hour_counts = anomalies_df2.groupby('hour').size().reset_index(name='count')
-            fig_hour = px.bar(
-                hour_counts, x='hour', y='count',
-                color='count',
-                color_continuous_scale='Reds',
-                labels={'hour': 'Hour of Day (0=Midnight)', 'count': 'Anomaly Occurrences'},
-                title="Distribution of Anomaly Hours"
-            )
-            fig_hour.update_layout(template="plotly_dark", height=300, showlegend=False)
-            st.plotly_chart(fig_hour, use_container_width=True)
-
-    st.markdown("---")
-
-    # ── Heart Rate Timeline ────────────────────────────────────────────────────
-    st.subheader("❤️ Heart Rate Timeline")
-    st.caption("Green = Normal | Red ✕ = Anomaly detected")
-    fig_hr = go.Figure()
-    fig_hr.add_trace(go.Scatter(
-        x=df['timestamp'], y=df['HeartRate'],
-        mode='lines', name='Heart Rate',
-        line=dict(color='#00CC96', width=1.5)
-    ))
-    fig_hr.add_trace(go.Scatter(
-        x=anomalies_df['timestamp'], y=anomalies_df['HeartRate'],
-        mode='markers', name='Anomaly',
-        marker=dict(color='#EF553B', size=7, symbol='x')
-    ))
-    fig_hr.update_layout(template="plotly_dark", hovermode="x unified", height=380)
-    st.plotly_chart(fig_hr, use_container_width=True)
-
-    # ── Step Count Bar ─────────────────────────────────────────────────────────
-    st.subheader("🚶 Step Count Activity")
-    st.caption("Red bars = anomalous hours | Blue bars = normal hours")
-    fig_steps = px.bar(
-        df, x='timestamp', y='StepCount',
-        color='is_anomaly',
-        color_discrete_map={False: '#636EFA', True: '#EF553B'},
-        labels={'is_anomaly': 'Anomaly'}
-    )
-    fig_steps.update_layout(template="plotly_dark", bargap=0, height=350)
-    st.plotly_chart(fig_steps, use_container_width=True)
-
-    # ── Reconstruction Error ───────────────────────────────────────────────────
-    st.markdown("---")
-    st.subheader("🤖 Autoencoder Reconstruction Error")
-    st.caption("The model flags sequences where reconstruction error exceeds the learned threshold (red dashed line).")
-    fig_err = go.Figure()
-    fig_err.add_trace(go.Scatter(
-        x=df['timestamp'], y=df['reconstruction_error'],
-        mode='lines', name='Reconstruction Error',
-        line=dict(color='#AB63FA', width=1.5)
-    ))
-    fig_err.add_hline(
-        y=threshold_val, line_dash='dash', line_color='red',
-        annotation_text=f"Threshold ({threshold_val:.4f})",
-        annotation_position="top left"
-    )
-    fig_err.add_trace(go.Scatter(
-        x=anomalies_df['timestamp'], y=anomalies_df['reconstruction_error'],
-        mode='markers', name='Above Threshold',
-        marker=dict(color='#EF553B', size=5)
-    ))
-    fig_err.update_layout(template="plotly_dark", hovermode="x unified", height=300)
-    st.plotly_chart(fig_err, use_container_width=True)
-
-    # ── Raw Data Table ─────────────────────────────────────────────────────────
-    with st.expander("📋 View Raw Data Table"):
-        st.dataframe(
-            df[['timestamp', 'HeartRate', 'StepCount', 'reconstruction_error', 'is_anomaly']].sort_values('timestamp'),
-            use_container_width=True
-        )
+        st.warning("Data loaded but no anomaly analysis found. Please upload a file containing 'is_anomaly' column or a raw 'export.xml' file.")
 
 else:
-    st.info("👈 **Upload your `dashboard_data.csv` file** in the sidebar to load your personal analysis.")
+    st.info("👈 **Upload your `export.xml` or `dashboard_data.csv`** in the sidebar.")
     st.markdown("""
-    ### How to generate your data:
-    ```bash
-    # Step 1: Parse Apple Health export
-    python parse_health_data.py
-    
-    # Step 2: Train autoencoder & detect anomalies
-    python anomaly_detector.py
-    
-    # Step 3: Upload the generated dashboard_data.csv in the sidebar
-    ```
+    ### How to use:
+    1. **Option A (Easy):** Upload your raw **`export.xml`** from Apple Health zip. The dashboard will automatically parse and use AI to find anomalies!
+    2. **Option B (Advanced):** Run the local Python scripts in the project folder to generate a `dashboard_data.csv` and upload that here.
     """)
