@@ -1,0 +1,39 @@
+# Large data files (do NOT upload to GitHub - too large)
+health_data_parsed.csv
+dashboard_data.csv
+anomaly_results.csv
+
+# Trained model weights (can be regenerated)
+*.pth
+
+# Apple Health raw export (very large - never upload)
+*.xml
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# IDE settings
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Jupyter notebooks (if any)
+.ipynb_checkpoints/
+
+# Temp inspection script
+inspect_health_data.py
