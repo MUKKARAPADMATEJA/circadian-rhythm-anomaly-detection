@@ -61,45 +61,57 @@ class LightweightAutoencoder(nn.Module):
     def forward(self, x):
         return self.decoder(self.encoder(x))
 
-# ─── XML PARSER ─────────────────────────────────────────────────────────────
+# ─── FUZZY XML PARSER (FUZZY LOGIC) ──────────────────────────────────────────
 def parse_apple_health_xml(file_obj):
     progress = st.empty()
     records = []
     
-    target_hr = "HKQuantityTypeIdentifierHeartRate"
-    target_steps = "HKQuantityTypeIdentifierStepCount"
+    # Standard Identifiers
+    ids = {
+        'HR': ["HeartRate", "8867-4", "Pulse"],
+        'SC': ["StepCount", "60621-0", "Steps"]
+    }
     
     try:
+        # iterparse directly on the file object
         context = ET.iterparse(file_obj, events=("end",))
         count = 0
         
         for event, elem in context:
-            if elem.tag == "Record":
-                rec_type = elem.get("type", "")
-                if rec_type in [target_hr, target_steps]:
-                    date_str = elem.get("startDate") or elem.get("creationDate")
-                    value = elem.get("value")
-                    if date_str and value:
-                        records.append({
-                            'timestamp': date_str,
-                            'type': 'HeartRate' if rec_type == target_hr else 'StepCount',
-                            'value': float(value)
-                        })
-                elem.clear()
+            # Check Record, observation, or clinical entry
+            tag = elem.tag.split('}')[-1] # Handle namespaces
             
+            # Extract possible type and value from attributes or children
+            etype = (elem.get("type") or elem.get("code") or "").lower()
+            evalue = elem.get("value")
+            edate = elem.get("startDate") or elem.get("creationDate") or elem.get("effectiveTime")
+            
+            # If it's a CDA file, the code and value may be in child elements
+            if tag == "observation" or tag == "Record":
+                # Heart Rate check
+                if any(x.lower() in etype for x in ids['HR']):
+                    if evalue and edate:
+                        records.append({'timestamp': edate, 'type': 'HeartRate', 'value': float(evalue)})
+                # Step Count check
+                elif any(x.lower() in etype for x in ids['SC']):
+                    if evalue and edate:
+                        records.append({'timestamp': edate, 'type': 'StepCount', 'value': float(evalue)})
+            
+            elem.clear()
             count += 1
-            if count % 20000 == 0:
-                progress.info(f"⏳ Processing: Read {count:,} XML records... ({len(records):,} target samples found)")
+            if count % 25000 == 0:
+                progress.info(f"⏳ Scanning Deeply: Read {count:,} XML components... ({len(records):,} samples extracted)")
         
         progress.empty()
         if not records:
-            st.error("❌ No HeartRate or StepCount data found.")
+            st.error("❌ No HeartRate or StepCount data signatures found in this file.")
             return None
             
         df = pd.DataFrame(records)
         df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True, errors='coerce')
         df = df.dropna(subset=['timestamp'])
         
+        # Resample to Hourly
         df_pivot = df.pivot_table(index='timestamp', columns='type', values='value', aggfunc='mean')
         df_resampled = df_pivot.resample('1H').mean()
         
@@ -115,12 +127,12 @@ def parse_apple_health_xml(file_obj):
             
         return df_resampled.fillna(0).reset_index()
     except Exception as e:
-        st.error(f"❌ XML Error: {e}")
+        st.error(f"❌ Smart XML Engine Error: {e}")
         return None
 
 # ─── INFERENCE ENGINE ─────────────────────────────────────────────────────────
 def run_anomaly_inference(df):
-    status = st.status("🧠 Running Deep Learning Anomaly Detection...")
+    status = st.status("🧠 Deep Learning Engine starting...")
     
     input_df = df[['HeartRate', 'StepCount']]
     scaler = MinMaxScaler()
@@ -133,7 +145,7 @@ def run_anomaly_inference(df):
     sequences = np.array(sequences)
     
     if len(sequences) == 0:
-        status.update(label="❌ Total data recorded is less than 24 hours.", state="error")
+        status.update(label="❌ Data trace too short for circadian analysis (Need 24h+)", state="error")
         return None
         
     input_dim = window_size * 2
@@ -143,7 +155,8 @@ def run_anomaly_inference(df):
     optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
     criterion = nn.MSELoss()
     
-    for _ in range(30):
+    status.update(label="🤖 Training AI on your unique biomarkers...")
+    for _ in range(40): # 40 epochs for more robustness
         model.train()
         optimizer.zero_grad()
         loss = criterion(model(X), X)
@@ -161,7 +174,7 @@ def run_anomaly_inference(df):
     results_df['is_anomaly'] = errors > threshold
     results_df['threshold'] = threshold
     
-    status.update(label="✅ Analysis Complete!", state="complete")
+    status.update(label="✅ Circadian Analysis Complete!", state="complete")
     return results_df
 
 # ─── HEADER ───────────────────────────────────────────────────────────────────
@@ -176,8 +189,8 @@ with st.sidebar:
     st.markdown("## ⚙️ Settings")
     st.markdown("---")
     uploaded_file = st.file_uploader(
-        "📂 Upload `export.xml` or `dashboard_data`",
-        help="Upload raw Apple Health XML or generated dashboard_data.csv (up to 2GB supported)."
+        "📂 Upload `export_cda.xml`, `export.xml` or CSV",
+        help="Upload any health XML or data file (up to 2GB supported)."
     )
     
     if st.button("🗑️ Clear Cache"):
@@ -189,8 +202,7 @@ with st.sidebar:
     st.markdown("""
     - **Model**: Lightweight Autoencoder (PyTorch)  
     - **Threshold**: 95th Percentile Reconstruction Error  
-    - **Data**: Apple Watch Heart Rate & Step Count  
-    - **Window**: 24-hour circadian cycle  
+    - **Mode**: Fuzzy Data Harvesting  
     """)
     st.markdown("---")
     st.markdown("**SDGs:** 🌱 Goal 3 · ⚙️ Goal 9")
@@ -198,8 +210,8 @@ with st.sidebar:
 # ─── DATA LOADING ─────────────────────────────────────────────────────────────
 @st.cache_data
 def load_data_from_file(file):
+    if file is None: return None
     try:
-        if file is None: return None
         file_name = file.name.lower()
         file.seek(0)
         
@@ -209,13 +221,13 @@ def load_data_from_file(file):
                 return run_anomaly_inference(raw_df)
             return None
             
+        # CSV handling
         header_sample = file.read(1024 * 10).decode('utf-8', errors='ignore').splitlines()
         file.seek(0)
-        
         header_row = 0
         found_header = False
         for i, line in enumerate(header_sample[:50]):
-            if 'timestamp' in line.lower() and ('reduction' in line.lower() or 'anomaly' in line.lower() or 'heartrate' in line.lower()):
+            if 'timestamp' in line.lower() and ('heartrate' in line.lower() or 'anomaly' in line.lower()):
                 header_row = i
                 found_header = True
                 break
@@ -255,12 +267,10 @@ if df is not None:
         normal_df = df[~df['is_anomaly']]
         threshold_val = df['threshold'].iloc[0] if 'threshold' in df.columns else 0.05
 
-        # Metrics
         total_hours = len(df)
         total_anomalies = len(anomalies_df)
         anomaly_rate = (total_anomalies / total_hours) * 100 if total_hours > 0 else 0
         
-        # Attribution
         hr_std_norm = normal_df['HeartRate'].std() if 'HeartRate' in normal_df.columns else 1
         hr_std_anom = anomalies_df['HeartRate'].std() if len(anomalies_df) > 0 else 0
         hr_deviation = (hr_std_anom - hr_std_norm) / hr_std_norm if hr_std_norm > 0 else 0
@@ -271,30 +281,26 @@ if df is not None:
         
         primary_cause = "Heart Rate" if hr_deviation > step_deviation else "Step Count"
 
-        # KPI Metrics Row
         st.subheader("📊 Key Performance Indicators")
         c1, c2, c3, c4, c5 = st.columns(5)
         c1.metric("🕐 Monitored Hours", f"{total_hours:,}")
         c2.metric("⚠️ Anomalies Detected", f"{total_anomalies:,}")
         c3.metric("📈 Anomaly Rate", f"{anomaly_rate:.2f}%")
         c4.metric("🔑 Primary Driver", primary_cause)
-        c5.metric("🤖 Detection Mode", "AI Inference")
+        c5.metric("🤖 Mode", "Fuzzy-Harvesting AI")
 
         st.markdown("---")
-        
-        # Doctor recommendations
         st.subheader("👨‍⚕️ Digital Doctor's Analysis & Recommendations")
-        st.warning(f"⚠️ **Doctor's Note:** We detected **{total_anomalies} hours** of circadian disruption. Primary driver: **{primary_cause}**.")
+        st.warning(f"⚠️ **Doctor's Note:** We detected **{total_anomalies} hours** of circadian disruption.")
         
         cd1, cd2 = st.columns(2)
         with cd1:
             st.markdown("##### 🫀 Heart Rate Recommendations")
-            st.info("Limit caffeine 6h before bed | Practice box breathing | Monitor resting HR.")
+            st.info("Limit caffeine 6h before bed | Practice box breathing.")
         with cd2:
             st.markdown("##### 👟 Activity Recommendations")
-            st.info("Consistent wake time | Morning sunlight exposure | Avoid vigorous night exercise.")
+            st.info("Consistent wake time | Morning sunlight exposure.")
 
-        # Timeline
         st.subheader("❤️ Heart Rate Timeline")
         fig_hr = go.Figure()
         fig_hr.add_trace(go.Scatter(x=df['timestamp'], y=df['HeartRate'], mode='lines', name='Heart Rate', line=dict(color='#00CC96')))
@@ -302,6 +308,6 @@ if df is not None:
         fig_hr.update_layout(template="plotly_dark", height=400)
         st.plotly_chart(fig_hr, use_container_width=True)
     else:
-        st.warning("Data loaded, but missing anomaly analysis. Please ensure you upload the correct file.")
+        st.warning("Data harvested, but missing anomaly detection columns. Re-training AI engine...")
 else:
-    st.info("👈 **Upload your raw `export.xml` or `dashboard_data.csv`** in the sidebar to begin analysis.")
+    st.info("👈 **Upload your raw `export_cda.xml` or `dashboard_data.csv`** in the sidebar to begin.")
