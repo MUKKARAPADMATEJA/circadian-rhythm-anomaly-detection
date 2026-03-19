@@ -1,6 +1,5 @@
 # Large data files (do NOT upload to GitHub - too large)
 health_data_parsed.csv
-dashboard_data.csv
 anomaly_results.csv
 
 # Trained model weights (can be regenerated)
